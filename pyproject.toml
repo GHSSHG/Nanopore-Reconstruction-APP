@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nanorecon"
+dynamic = ["version"]  # from nanorecon.__version__
+description = "Compress nanopore POD5 signal into NanoRecon codebook tokens and reconstruct POD5 from them."
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+authors = [{ name = "GHSSHG" }]
+# Direct dependencies pinned to the combination the app was written and checked against.
+# Running compress/decompress needs a Linux NVIDIA GPU and the `cuda12` extra.
+dependencies = [
+  "numpy==2.3.5",
+  "jax==0.8.2",
+  "jaxlib==0.8.2",
+  "flax==0.12.3",
+  "pod5==0.3.35",
+  "huggingface_hub==1.7.2",
+  # SOCKS proxies (ALL_PROXY=socks5://...) need socksio in httpx.
+  "httpx[socks]>=0.28,<1",
+]
+
+[project.optional-dependencies]
+cuda12 = ["jax[cuda12]==0.8.2"]
+dev = ["pytest>=8"]
+
+[project.scripts]
+nanorecon = "nanorecon.cli:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "nanorecon.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["nanorecon*"]
+
+[tool.pytest.ini_options]
+# Plain `pytest` runs the unit tests only (no GPU, network or model); GPU tests: `pytest tests/gpu`.
+testpaths = ["tests/unit"]
+filterwarnings = [
+  "ignore::DeprecationWarning:pod5.*",
+]
