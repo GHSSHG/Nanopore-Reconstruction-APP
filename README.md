@@ -15,8 +15,8 @@ those tokens.
 ## Requirements
 
 * Linux x86_64 with glibc 2.27 or newer (Ubuntu 18.04+, RHEL/Rocky 8+).
-* An NVIDIA GPU with a driver that supports CUDA 12 (525 or newer). CUDA itself is installed
-  with the Python dependencies.
+* An NVIDIA GPU of the Ampere generation or newer (A100, RTX 30 series or later) with a driver
+  that supports CUDA 12 (525 or newer). CUDA itself is installed with the Python dependencies.
 * Python 3.11-3.13 with the `venv` module (Ubuntu 24.04 ships 3.12).
 * Network access to PyPI while installing (about 3 GB of dependencies) and to huggingface.co
   for the model (420 MB). About 8 GB of free disk space.
@@ -27,22 +27,22 @@ Download the installer from the
 [Releases page](https://github.com/GHSSHG/Nanopore-Reconstruction-APP/releases) and run it:
 
 ```bash
-curl -LO https://github.com/GHSSHG/Nanopore-Reconstruction-APP/releases/download/v0.3.0/nanorecon-0.3.0-linux-x86_64.sh
-bash nanorecon-0.3.0-linux-x86_64.sh
+curl -LO https://github.com/GHSSHG/Nanopore-Reconstruction-APP/releases/download/v1.0.0/nanorecon-1.0.0-linux-x86_64.sh
+bash nanorecon-1.0.0-linux-x86_64.sh
 ```
 
-The installer (about 60 KB) checks the system, creates its own Python environment in
-`~/.local/share/nanorecon/0.3.0`, downloads the dependencies into it, links
+The installer (about 70 KB) checks the system, creates its own Python environment in
+`~/.local/share/nanorecon/1.0.0`, downloads the dependencies into it, links
 `~/.local/bin/nanorecon` and downloads the model. It takes a few minutes; the full output goes
-to `~/.local/share/nanorecon/install-0.3.0.log`. If `~/.local/bin` is not on your `PATH`, the
+to `~/.local/share/nanorecon/install-1.0.0.log`. If `~/.local/bin` is not on your `PATH`, the
 installer says how to add it.
 
 * **Upgrade:** run the installer of the new version. Each version has its own directory and the
   `nanorecon` link moves to the newest; older versions stay usable as
   `~/.local/share/nanorecon/<version>/bin/nanorecon`.
 * **Uninstall:** `rm -rf ~/.local/share/nanorecon ~/.local/bin/nanorecon`
-* **Manual install:** `bash nanorecon-0.3.0-linux-x86_64.sh --extract DIR` unpacks the wheel;
-  install it into any environment with `pip install "DIR/nanorecon-0.3.0-py3-none-any.whl[cuda12]"`.
+* **Manual install:** `bash nanorecon-1.0.0-linux-x86_64.sh --extract DIR` unpacks the wheel;
+  install it into any environment with `pip install "DIR/nanorecon-1.0.0-py3-none-any.whl[cuda12]"`.
 
 ## Use
 
@@ -60,9 +60,9 @@ nanorecon decompress reads.nrpod -o reconstructed.pod5
 | `ls-remote` | the model on the Hugging Face Hub, and whether its commit is still available |
 | `info` | network summary and the inference rules |
 
-* `--batch-size N`: chunks per GPU call (a chunk is 8 192 samples; default 64). Larger is faster
-  and uses more GPU memory; see [Recommended settings](#recommended-settings). The result does
-  not depend on it in any meaningful way.
+* `--batch-size N`: chunks per GPU call (a chunk is 8 192 samples; default 64). Larger batches
+  compress faster and use more GPU memory; see [Recommended settings](#recommended-settings).
+  The result does not depend on it in any meaningful way.
 * `--force`: replace an existing output, only after the new file is complete.
 * `-v`: debug logging, model timings, and a traceback on errors.
 * Choose the GPU with `CUDA_VISIBLE_DEVICES`, e.g. `CUDA_VISIBLE_DEVICES=1 nanorecon compress ...`.
@@ -73,16 +73,21 @@ Results go to stdout as one line; logs, progress and errors go to stderr. Exit c
 
 ## Recommended settings
 
-Measured on an A100-class GPU with 32 GB (compression; one chunk is 8 192 samples):
+Measured with 1.0.0 on an RTX 3080 Ti (12 GB), with simulated files of about 3 000 chunks
+(one chunk is 8 192 samples; model loading and compilation not included):
 
-| `--batch-size` | Compression speed | GPU memory |
-|---|---|---|
-| 16 | 330 chunks/s | 1.1 GiB |
-| 64 (default) | 740 chunks/s | 1.7 GiB |
-| 256 | 1 090 chunks/s | 4.9 GiB |
+| `--batch-size` | Compression | Decompression | GPU memory |
+|---|---|---|---|
+| 16 | 440-460 chunks/s | 380 chunks/s | 1.0 GiB |
+| 64 (default) | 670-700 chunks/s | 390-400 chunks/s | 1.4 GiB |
+| 256 | 750-820 chunks/s | 380 chunks/s | 3.4 GiB |
 
-* **Lab server (32 GB GPUs, 512 GB RAM):** use `--batch-size 256` for both commands. A 2 GB POD5
-  then compresses in about 5 minutes. Host memory is no concern: a run needs about 2 GB of RAM.
+The lab's A100-class GPUs are faster: there, 0.3.0 compressed 1.7-2.2 times faster than on
+this card. 1.0.0 has not been measured on them yet. Details: [docs/validation.md](docs/validation.md).
+
+* **Lab server (32 GB GPUs, 512 GB RAM):** compress with `--batch-size 256`. Decompress with the
+  default 64, because larger batches do not make decompression faster. Host memory is no
+  concern: a run needs about 2 GB of RAM.
 * **Many files:** the GPU is the bottleneck, so run one process per GPU, each on its own share of
   the files:
 
@@ -98,7 +103,8 @@ Measured on an A100-class GPU with 32 GB (compression; one chunk is 8 192 sample
   wait
   ```
 
-* **Smaller or shared GPUs (8-16 GB, or other jobs on the same card):** keep the default 64.
+* **Smaller or shared GPUs (other jobs on the same card):** batch 256 needs about 3.5 GiB of GPU
+  memory; use the default 64 when less is free. Batch 512 did not fit on a 12 GB card.
 * Long runs keep the GPUs at full load; keep an eye on their temperature (`nvidia-smi`).
 
 ## Files and caches
@@ -108,7 +114,7 @@ Measured on an A100-class GPU with 32 GB (compression; one chunk is 8 192 sample
   `compress` and `decompress` never access the network; to use a machine without network
   access, copy the cache directory there and point `HF_HOME` at it.
 * The JAX compilation cache in `~/.cache/nanorecon/jax` shortens later start-ups (the first run
-  of a batch size compiles for about 5-10 seconds).
+  of a batch size compiles for about 10 seconds).
 
 ## Output files and failures
 
@@ -132,7 +138,7 @@ Reads keep their order; duplicate read ids are kept as they are; zero-length and
 are kept.
 
 Not preserved: the signal samples themselves (reconstructed), and file-level attributes of the
-source POD5 (file identifier, writing software - the output names `nanorecon 0.3.0` - and its
+source POD5 (file identifier, writing software - the output names `nanorecon` and its version - and its
 internal batching). Inputs must be sampled at 5 kHz; other rates are rejected, not resampled.
 Inputs with metadata POD5 cannot write back (null values, unknown end reasons) are rejected at
 compress time.
@@ -140,7 +146,7 @@ compress time.
 ## Documentation
 
 * [docs/format.md](docs/format.md) - token file specification and the inference rules
-* [docs/validation.md](docs/validation.md) - test results on real data
+* [docs/validation.md](docs/validation.md) - test results, speed and GPU memory
 
 ## Development
 

@@ -11,6 +11,7 @@ from dataclasses import replace
 
 import pytest
 
+from nanorecon import __version__
 from nanorecon.cli import main
 from nanorecon.io.container import ContainerWriter, FileHeader
 from nanorecon.model_config import MODEL, PROFILE, REVISION
@@ -43,7 +44,7 @@ def test_model_commands_do_not_import_jax(tmp_path):
 
 def test_version_and_help(capsys):
     code, out, _ = run(capsys, "--version")
-    assert code == 0 and out.strip() == "nanorecon 0.3.0"
+    assert code == 0 and out.strip() == f"nanorecon {__version__}"
     code, out, _ = run(capsys, "compress", "--help")
     assert code == 0 and "--batch-size" in out and "default 64" in out
 

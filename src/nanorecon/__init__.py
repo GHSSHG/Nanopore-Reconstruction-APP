@@ -4,5 +4,5 @@ compress: POD5 -> intermediate token file (.nrpod); decompress: token file -> PO
 The heavy runtime (JAX/Flax) is imported only by the business commands.
 """
 
-__version__ = "0.3.0"
+__version__ = "1.0.0"
 APP_NAME = "nanorecon"
