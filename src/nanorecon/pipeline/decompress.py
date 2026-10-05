@@ -5,6 +5,9 @@ batches (each row is one independent chunk; codes are never concatenated into on
 sequence). Each decoded chunk is denormalized to pA and added to its read's stitch
 accumulator; a read whose chunks are all in is converted to ADC once and written with its Meta,
 in file order. The model identity and decoding rules come from the file header.
+
+One thread: a full batch is sent off and the previous one is collected, stitched and written
+(and the next codes are read) while the GPU computes.
 """
 
 from __future__ import annotations
@@ -34,7 +37,7 @@ log = logging.getLogger("nanorecon")
 class Decoder(Protocol):
     batch_size: int
 
-    def decode(self, codes: np.ndarray, valid_rows: int) -> np.ndarray: ...
+    def decode_async(self, codes: np.ndarray, valid_rows: int) -> Callable[[], np.ndarray]: ...
 
 
 @dataclass(frozen=True)
@@ -77,14 +80,18 @@ class _PendingRead:
 
 
 class _BatchDecoder:
-    """Packs the chunks of consecutive reads into full decoder batches and hands back the reads
-    whose chunks are all decoded, in file order. At most about one batch worth of reads is open."""
+    """Packs the chunks of consecutive reads into decoder batches (two alternating buffers). A full
+    batch is sent to the decoder at once and collected when the next one is sent (or at the end),
+    so host work overlaps the GPU. Reads come back in file order once all their chunks are
+    decoded; about two batches worth of reads are open at a time."""
 
     def __init__(self, engine: Decoder, profile: CodecProfile) -> None:
         self.engine = engine
         self.batch = engine.batch_size
-        self.codes = np.zeros((self.batch, profile.tokens_per_chunk), dtype=np.uint16)
+        self._codes = [np.zeros((self.batch, profile.tokens_per_chunk), dtype=np.uint16) for _ in range(2)]
+        self._fill = 0  # the buffer being filled; the other one may still be on the GPU
         self.rows: list[tuple[_PendingRead, int]] = []  # (read, chunk index) per filled row
+        self._in_flight: tuple[Callable[[], np.ndarray], list[tuple[_PendingRead, int]]] | None = None
         self.pending: deque[_PendingRead] = deque()
 
     def add(self, read: _PendingRead, codes: np.ndarray) -> list[_PendingRead]:
@@ -94,27 +101,39 @@ class _BatchDecoder:
         while i < codes.shape[0]:
             row = len(self.rows)
             n = min(self.batch - row, codes.shape[0] - i)
-            self.codes[row : row + n] = codes[i : i + n]
+            self._codes[self._fill][row : row + n] = codes[i : i + n]
             self.rows.extend((read, i + k) for k in range(n))
             i += n
             if len(self.rows) == self.batch:
-                self._decode()
+                self._send()
         return self._finished()
 
     def flush(self) -> list[_PendingRead]:
         if self.rows:
-            self._decode()
+            self._send()
+        self._collect()
         return self._finished()
 
-    def _decode(self) -> None:
+    def _send(self) -> None:
         n = len(self.rows)
+        buffer = self._codes[self._fill]
         if n < self.batch:
-            self.codes[n:] = 0  # padding rows; their output is discarded
-        decoded = self.engine.decode(self.codes, n)
-        for r, (read, index) in enumerate(self.rows):
+            buffer[n:] = 0  # padding rows; their output is discarded
+        wait = self.engine.decode_async(buffer, n)
+        self._collect()  # the previous batch, decoded while this one was filled
+        self._in_flight = (wait, self.rows)
+        self.rows = []
+        self._fill ^= 1
+
+    def _collect(self) -> None:
+        if self._in_flight is None:
+            return
+        wait, rows = self._in_flight
+        self._in_flight = None
+        decoded = wait()
+        for r, (read, index) in enumerate(rows):
             read.acc.add(index, decoded[r], read.centers[index], read.scales[index])
             read.remaining -= 1
-        self.rows.clear()
 
     def _finished(self) -> list[_PendingRead]:
         done = []

@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import threading
-import time
 import uuid
 from dataclasses import replace
 from pathlib import Path
@@ -138,64 +136,99 @@ def write_pod5(path: Path, lengths, *, seed: int = 0, run_infos=None, special: b
 class LookupEngine:
     """Lossless stand-in for the model: encode stores each chunk under a fresh id (written into
     the first two tokens), decode returns the stored chunk. A compress -> decompress round trip
-    through it must reproduce the ADC signal, so any read/chunk/order mistake is visible."""
+    through it must reproduce the ADC signal, so any read/chunk/order mistake is visible.
+
+    Like a GPU, the async calls read their input only when the result is collected, so a
+    pipeline that reused a buffer still in flight would break the round trip. `events` records
+    ("send" | "collect", direction, call number)."""
 
     def __init__(self, batch_size: int, profile: CodecProfile) -> None:
         self.batch_size = batch_size
         self.L, self.T = profile.chunk_samples, profile.tokens_per_chunk
         self._store: dict[int, np.ndarray] = {}
-        self._lock = threading.Lock()
         self.encode_calls = 0
         self.decode_calls = 0
+        self.events: list[tuple[str, str, int]] = []
 
-    def encode(self, batch: np.ndarray, valid_rows: int) -> np.ndarray:
+    def encode_async(self, batch: np.ndarray, valid_rows: int):
         assert batch.shape == (self.batch_size, self.L) and batch.dtype == np.float32
         self.encode_calls += 1
-        codes = np.zeros((valid_rows, self.T), dtype=np.uint16)
-        with self._lock:
+        call = self.encode_calls
+        self.events.append(("send", "encode", call))
+
+        def collect() -> np.ndarray:
+            self.events.append(("collect", "encode", call))
+            codes = np.zeros((valid_rows, self.T), dtype=np.uint16)
             for r in range(valid_rows):
                 key = len(self._store) + 1
                 self._store[key] = batch[r].copy()
                 codes[r, 0], codes[r, 1] = key & 0xFFFF, key >> 16
-        return codes
+            return codes
 
-    def decode(self, codes: np.ndarray, valid_rows: int) -> np.ndarray:
+        return collect
+
+    def decode_async(self, codes: np.ndarray, valid_rows: int):
         assert codes.shape == (self.batch_size, self.T)
         self.decode_calls += 1
-        out = np.empty((valid_rows, self.L), dtype=np.float32)
-        for r in range(valid_rows):
-            out[r] = self._store[int(codes[r, 0]) | (int(codes[r, 1]) << 16)]
-        return out
+        call = self.decode_calls
+        self.events.append(("send", "decode", call))
+
+        def collect() -> np.ndarray:
+            self.events.append(("collect", "decode", call))
+            out = np.empty((valid_rows, self.L), dtype=np.float32)
+            for r in range(valid_rows):
+                out[r] = self._store[int(codes[r, 0]) | (int(codes[r, 1]) << 16)]
+            return out
+
+        return collect
+
+    def encode(self, batch: np.ndarray, valid_rows: int) -> np.ndarray:
+        return self.encode_async(batch, valid_rows)()
+
+    def decode(self, codes: np.ndarray, valid_rows: int) -> np.ndarray:
+        return self.decode_async(codes, valid_rows)()
 
 
 class ContentEngine:
-    """Deterministic content-derived codes (so threaded and inline runs must agree byte for byte);
-    decode is a piecewise-constant approximation. Optional delay perturbs timing."""
+    """Deterministic content-derived codes (so runs with different batch sizes must agree byte for
+    byte); decode is a piecewise-constant approximation. Optionally fails when the result of a
+    given call is collected. Inputs are read at collection time, as with LookupEngine."""
 
-    def __init__(self, batch_size: int, profile: CodecProfile, *, delay_s: float = 0.0, fail_on_call: int | None = None, fail_with: BaseException | None = None) -> None:
+    def __init__(self, batch_size: int, profile: CodecProfile, *, fail_on_call: int | None = None, fail_with: BaseException | None = None) -> None:
         self.batch_size = batch_size
         self.L, self.T = profile.chunk_samples, profile.tokens_per_chunk
-        self.delay_s = delay_s
         self.fail_on_call = fail_on_call
         self.fail_with = fail_with
         self.calls = 0
         self._weights = (np.arange(self.L) % 251 + 1).astype(np.float64)
 
-    def encode(self, batch: np.ndarray, valid_rows: int) -> np.ndarray:
+    def encode_async(self, batch: np.ndarray, valid_rows: int):
         self.calls += 1
-        if self.fail_on_call is not None and self.calls == self.fail_on_call:
-            raise self.fail_with or RuntimeError("injected encode failure")
-        if self.delay_s:
-            time.sleep(self.delay_s)
-        seg = batch[:valid_rows].reshape(valid_rows, self.T, self.L // self.T).mean(axis=2)
-        codes = np.clip(np.rint((seg + 1.0) * 0.5 * 65535.0), 0, 65535).astype(np.uint16)
-        for r in range(valid_rows):  # position-weighted sum, so distinct chunks get distinct first tokens
-            codes[r, 0] = int(np.rint(np.dot(batch[r].astype(np.float64), self._weights) * 1000.0)) % 65536
-        return codes
+        call = self.calls
+
+        def collect() -> np.ndarray:
+            if self.fail_on_call is not None and call == self.fail_on_call:
+                raise self.fail_with or RuntimeError("injected encode failure")
+            seg = batch[:valid_rows].reshape(valid_rows, self.T, self.L // self.T).mean(axis=2)
+            codes = np.clip(np.rint((seg + 1.0) * 0.5 * 65535.0), 0, 65535).astype(np.uint16)
+            for r in range(valid_rows):  # position-weighted sum, so distinct chunks get distinct first tokens
+                codes[r, 0] = int(np.rint(np.dot(batch[r].astype(np.float64), self._weights) * 1000.0)) % 65536
+            return codes
+
+        return collect
+
+    def decode_async(self, codes: np.ndarray, valid_rows: int):
+        def collect() -> np.ndarray:
+            vals = codes[:valid_rows].astype(np.float32) / 65535.0 * 2.0 - 1.0
+            return np.repeat(vals, self.L // self.T, axis=1)
+
+        return collect
+
+    def encode(self, batch: np.ndarray, valid_rows: int) -> np.ndarray:
+        return self.encode_async(batch, valid_rows)()
 
     def decode(self, codes: np.ndarray, valid_rows: int) -> np.ndarray:
-        vals = codes[:valid_rows].astype(np.float32) / 65535.0 * 2.0 - 1.0
-        return np.repeat(vals, self.L // self.T, axis=1)
+        return self.decode_async(codes, valid_rows)()
 
 
 def small_profile(profile: CodecProfile, **changes) -> CodecProfile:

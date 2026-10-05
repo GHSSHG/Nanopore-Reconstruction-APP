@@ -23,7 +23,11 @@ those tokens.
 
 ## Install
 
+Download the installer from the
+[Releases page](https://github.com/GHSSHG/Nanopore-Reconstruction-APP/releases) and run it:
+
 ```bash
+curl -LO https://github.com/GHSSHG/Nanopore-Reconstruction-APP/releases/download/v0.3.0/nanorecon-0.3.0-linux-x86_64.sh
 bash nanorecon-0.3.0-linux-x86_64.sh
 ```
 
@@ -144,5 +148,5 @@ compress time.
 pip install -e ".[dev]"
 pytest                                   # unit tests: no GPU, network or model needed
 nanorecon pull && pytest tests/gpu -v    # on a GPU machine
-tools/build_installer.sh                 # builds dist/nanorecon-<version>-linux-x86_64.sh
+tools/build_installer.sh                 # builds dist/nanorecon-<version>-linux-x86_64.sh for a GitHub Release
 ```

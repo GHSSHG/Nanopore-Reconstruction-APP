@@ -259,9 +259,15 @@ compress:   latents (B, T, D) -> index of the nearest projected codeword (square
 decompress: index -> projected_codebook[index] -> post_quant_conv -> decoder
 ```
 
-The search uses the training arithmetic (`|z|^2 + |e|^2 - 2 z.e`, codebook scanned in blocks of
-`search_chunk_size`); ties go to the lowest index. The training config's `diveq_sigma2 = 0.001`
-is not used: inference has no noise, dropout or random keys.
+The search computes `|z|^2 + |e|^2 - 2 z.e` as in training and checks every codeword; ties go to
+the lowest index. One GPU kernel computes the distances tile by tile (256 codewords) and keeps only
+each row's minimum, so the full distance matrix is never stored (the training config's
+`search_chunk_size` is not used). The dot products take fp16 operands and sum in
+fp32: each latent and the codebook are first scaled by a power of two and rounded to nearest with
+ties away from zero, which is how the GPU forms the TF32 operands used in training, so the operands
+are the same and only the summation order differs. Norms, sums and comparisons are fp32. The
+training config's `diveq_sigma2 = 0.001` is not used: inference has no noise, dropout or random
+keys.
 
 ### 7.5 Stitching (`linear_edges_v1`) and ADC conversion (`rint_clip_int16`)
 
@@ -281,12 +287,22 @@ to integers before merging. A future change of the weighting gets a new stitch n
 
 ### 7.6 Numerics
 
-* Matmul precision `high` (as in training). The decoder attention uses cuDNN with bfloat16
-  q/k/v, as in training.
+* Matmul precision `high` (as in training): TF32 inputs, fp32 sums. Two exceptions take fp16
+  operands (the same 10-bit mantissa as TF32, scaled by powers of two, fp32 sums and outputs):
+  the codebook search (7.4) and the decoder's ConvNeXt pointwise layers, whose input scales follow
+  from the weights so they cannot overflow. Compared with TF32 throughout, about 0.01% of codes and
+  0.15-0.17% of reconstructed samples (by one ADC unit) changed on an RTX 3080 Ti, less than a
+  change of batch size causes. The decoder attention uses cuDNN with bfloat16 q/k/v, as in
+  training.
 * The ISTFT overlap-add is computed deterministically (shifted segment sums) instead of the
   training code's scatter-add; for identical codes the decoder output differed from the training
   model by at most ~7e-7 (normalized units, measured on CPU).
-* For a given batch size the codes do not depend on which chunks share a batch (padding rows
-  never change real rows), and repeated runs give identical files. Across batch sizes, GPU models
-  or library versions, kernel choices can flip near-tie codewords: 0.6-0.8% of codes differed
-  between batch 16, 64 and 256 on an A100-class GPU, with unchanged reconstruction error.
+* The codes do not depend on which chunks share a batch (padding rows never change real rows).
+  Repeated runs give identical files as long as they reuse the same compiled program (the JAX
+  compilation cache in `~/.cache/nanorecon/jax`). A new compilation lets XLA's autotuner choose the
+  fastest GPU kernels again; kernels that sum in a different order can flip near-tie codewords.
+  Between separate compilations for the same batch size up to about 0.5% of codes differed (RTX
+  3080 Ti), between batch 16, 64 and 256 0.6-0.8% (A100-class GPU), with unchanged reconstruction
+  error. Batch size, GPU model and library versions act the same way. The decoder is affected
+  alike: the same codes decoded with batch 64 and with batch 256 differed in about 1% of the output
+  samples by one ADC unit.

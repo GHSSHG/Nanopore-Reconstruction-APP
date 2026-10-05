@@ -21,7 +21,7 @@ from .types import Cancelled, ExitCode, NanoReconError, UsageError
 
 log = logging.getLogger("nanorecon")
 
-BATCH_SIZE = 64  # chunks per GPU call; ~1.7 GiB of GPU memory (256: ~4.9 GiB, faster)
+BATCH_SIZE = 64  # chunks per GPU call; ~1.4 GiB of GPU memory (256: ~3.4 GiB, faster)
 
 
 class _Parser(argparse.ArgumentParser):

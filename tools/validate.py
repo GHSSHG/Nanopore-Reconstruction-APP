@@ -4,10 +4,12 @@
                              [--decompress-batch-sizes 16,64] [--workdir DIR] [--report report.json]
 
 For each batch size a child process loads the model, compresses once and (for the decompress
-batch sizes) decompresses once, reporting wall time, GPU time, padding rows, peak GPU memory and
-peak host RSS. The parent then checks the first reconstruction against the input:
-Meta, order and length, and the pA error by region (read interior, regular seams, the overlap of
-the right-aligned last window, read edges, short reads), by read length and by signal level.
+batch sizes) decompresses once, reporting wall time, GPU wait (time the host spent sending
+batches and waiting for results; host work done while the GPU computes is not in it), padding
+rows, peak GPU memory and peak host RSS. The parent then checks the first reconstruction against
+the input: Meta, order and length, and the pA error by region (read interior, regular seams, the
+overlap of the right-aligned last window, read edges, short reads), by read length and by signal
+level.
 """
 
 from __future__ import annotations

@@ -1,6 +1,6 @@
 """Shared data structures, exit codes and error types.
 
-Runtime objects (arrays, threads, slots) live in the pipeline modules; this module only
+Runtime objects (arrays, batch buffers) live in the pipeline modules; this module only
 holds plain values that cross module boundaries.
 """
 

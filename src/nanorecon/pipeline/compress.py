@@ -3,10 +3,12 @@
     group consecutive reads (Meta first; signals load once a read joins the group)
       -> prepare the group's chunks in order (calibrate, normalize, pad) into a batch
       -> encode each full batch on the GPU and store the codes at the chunks' positions
-      -> write the group in read order, then start the next group.
+      -> write a group, in read order, once all its codes are in.
 
 Batches span reads, so short reads do not waste GPU rows; only a group's last batch is padded.
-The GPU dominates the run time, so everything runs on one thread.
+Everything runs on one thread, but the host never waits idle for the GPU: a batch is sent off,
+the next one is prepared (and finished groups are written, the next group is read) while the GPU
+computes, and only then are the codes of the batch collected.
 """
 
 from __future__ import annotations
@@ -14,6 +16,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterator, Protocol
@@ -36,7 +39,7 @@ log = logging.getLogger("nanorecon")
 class Encoder(Protocol):
     batch_size: int
 
-    def encode(self, batch: np.ndarray, valid_rows: int) -> np.ndarray: ...
+    def encode_async(self, batch: np.ndarray, valid_rows: int) -> Callable[[], np.ndarray]: ...
 
 
 @dataclass(frozen=True)
@@ -76,6 +79,7 @@ class ReadGroup:
         self.codes = np.empty((self.total_chunks, profile.tokens_per_chunk), dtype=np.uint16)
         self.centers = np.empty(self.total_chunks, dtype=np.float32)
         self.scales = np.empty(self.total_chunks, dtype=np.float32)
+        self.batches_out = 0  # batches sent to the encoder whose codes are not in yet
 
     def encoded(self, slot: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         a, b = int(self.offsets[slot]), int(self.offsets[slot + 1])
@@ -143,36 +147,68 @@ def admit_groups(reads: Iterator[SourceRead], profile: CodecProfile, group_chunk
 
 
 class ChunkEncoder:
-    """Prepares a group's chunks in order into one staging batch and encodes full batches."""
+    """Prepares chunks in order into two alternating staging batches. A full batch is sent to the
+    encoder at once and its codes are collected after the next batch has been sent (or at the
+    end), so preparing chunks, reading and writing overlap the GPU. Groups come back in order once
+    all their codes are in."""
 
     def __init__(self, engine: Encoder, profile: CodecProfile) -> None:
         self.engine = engine
         self.batch = engine.batch_size
-        self.staging = np.zeros((self.batch, profile.chunk_samples), dtype=np.float32)
+        self._staging = [np.zeros((self.batch, profile.chunk_samples), dtype=np.float32) for _ in range(2)]
+        self._fill = 0  # the staging batch being filled; the other one may still be on the GPU
         self._scratch = np.empty(profile.chunk_samples, dtype=np.float32)
         self._eps = np.float32(profile.normalization_epsilon)
+        self._in_flight: tuple[Callable[[], np.ndarray], ReadGroup, int, int] | None = None
+        self._open: deque[ReadGroup] = deque()  # groups not handed back yet, in order
 
-    def encode_group(self, group: ReadGroup) -> None:
-        first = 0  # group-wide index of the chunk in staging row 0
-        rows = 0
+    def add(self, group: ReadGroup) -> list[ReadGroup]:
+        """Prepare and send off a group's chunks; returns the groups completed meanwhile."""
+        self._open.append(group)
+        done: list[ReadGroup] = []
+        staging, first, rows = self._staging[self._fill], 0, 0  # first: group-wide index of row 0
         for slot, plan in enumerate(group.plans):
             offset, scale = group.calibrations[slot]
             for seq in range(plan.num_chunks):
                 center, half = prepare_chunk(group.signals[slot], plan, seq, offset, scale, self._eps,
-                                             self.staging[rows], self._scratch)
+                                             staging[rows], self._scratch)
                 group.centers[first + rows] = center
                 group.scales[first + rows] = half
                 rows += 1
                 if rows == self.batch:
-                    self._flush(group, first, rows)
-                    first += rows
-                    rows = 0
+                    done += self._send(group, first, rows)
+                    staging, first, rows = self._staging[self._fill], first + rows, 0
         if rows:
-            self.staging[rows:] = 0.0  # padding rows; their results are discarded
-            self._flush(group, first, rows)
+            staging[rows:] = 0.0  # padding rows; their results are discarded
+            done += self._send(group, first, rows)
+        group.signals.clear()  # all chunks are prepared
+        return done + self._completed()
 
-    def _flush(self, group: ReadGroup, first: int, rows: int) -> None:
-        group.codes[first : first + rows] = self.engine.encode(self.staging, rows)
+    def finish(self) -> list[ReadGroup]:
+        """Collect the last batch; returns the remaining groups."""
+        self._collect()
+        return self._completed()
+
+    def _send(self, group: ReadGroup, first: int, rows: int) -> list[ReadGroup]:
+        wait = self.engine.encode_async(self._staging[self._fill], rows)
+        group.batches_out += 1
+        self._collect()  # the previous batch, computed while this one was prepared
+        self._in_flight = (wait, group, first, rows)
+        self._fill ^= 1
+        return self._completed()
+
+    def _collect(self) -> None:
+        if self._in_flight is not None:
+            wait, group, first, rows = self._in_flight
+            self._in_flight = None
+            group.codes[first : first + rows] = wait()
+            group.batches_out -= 1
+
+    def _completed(self) -> list[ReadGroup]:
+        done = []
+        while self._open and self._open[0].batches_out == 0:
+            done.append(self._open.popleft())
+        return done
 
 
 def compress_file(
@@ -213,11 +249,7 @@ def compress_file(
                 try:
                     with _writing(output_path):
                         writer = ContainerWriter(fh, header)
-                    for group in admit_groups(source.iter_reads(), profile, options.group_chunks, options.group_reads):
-                        report.groups += 1
-                        report.max_group_reads_seen = max(report.max_group_reads_seen, len(group.metas))
-                        report.max_group_chunks_seen = max(report.max_group_chunks_seen, group.total_chunks)
-                        encoder.encode_group(group)
+                    def write(group: ReadGroup) -> None:
                         with _writing(output_path):
                             _write_group(writer, group)
                         for meta, plan in zip(group.metas, group.plans):
@@ -227,7 +259,16 @@ def compress_file(
                             report.empty_reads += meta.num_samples == 0
                         if progress is not None:
                             progress.update(report.reads, report.samples)
+
+                    for group in admit_groups(source.iter_reads(), profile, options.group_chunks, options.group_reads):
+                        report.groups += 1
+                        report.max_group_reads_seen = max(report.max_group_reads_seen, len(group.metas))
+                        report.max_group_chunks_seen = max(report.max_group_chunks_seen, group.total_chunks)
+                        for done in encoder.add(group):
+                            write(done)
                         del group
+                    for done in encoder.finish():
+                        write(done)
                     with _writing(output_path):
                         writer.finish()
                 finally:

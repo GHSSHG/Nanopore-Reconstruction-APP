@@ -98,6 +98,24 @@ def test_decompress_packs_reads_into_full_batches(tmp_path, profile):
         assert read_meta_equal(m1, m2) and np.array_equal(s1, s2)
 
 
+def test_next_batch_is_sent_before_the_previous_is_collected(tmp_path, pod5_file, profile):
+    """The host prepares, reads and writes while the GPU computes: batch n + 1 is sent before
+    batch n is collected, results are collected in order, and at most two batches are out."""
+    engine = LookupEngine(4, profile)
+    token_file, _ = compress(tmp_path, pod5_file, profile, engine)
+    decompress(token_file, tmp_path / "back.pod5", engine)
+    for direction in ("encode", "decode"):
+        order = [(kind, call) for kind, d, call in engine.events if d == direction]
+        sends = [call for kind, call in order if kind == "send"]
+        assert len(sends) >= 3 and [call for kind, call in order if kind == "collect"] == sends
+        for call in sends[:-1]:
+            assert order.index(("send", call + 1)) < order.index(("collect", call))
+        out = 0
+        for kind, _ in order:
+            out += 1 if kind == "send" else -1
+            assert out <= 2
+
+
 def group_layout(path):
     """[[num_chunks of each read] per group]"""
     with open(path, "rb") as fh:
@@ -208,11 +226,11 @@ def test_decoder_failure_leaves_no_pod5(tmp_path, pod5_file, profile):
         def __init__(self):
             self.n = 0
 
-        def decode(self, codes, rows):
+        def decode_async(self, codes, rows):
             self.n += 1
             if self.n == 4:
                 raise RuntimeError("decode failure")
-            return engine.decode(codes, rows)
+            return engine.decode_async(codes, rows)
 
     with pytest.raises(RuntimeError, match="decode failure"):
         decompress(token_file, tmp_path / "x.pod5", Broken())

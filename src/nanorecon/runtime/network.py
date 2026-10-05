@@ -7,19 +7,44 @@ unchanged:
 Only the hard-codeword inference path exists here. There are no train flags, dropout, DiVeQ
 noise, random keys or monitoring outputs; codes are chosen by exact nearest-neighbour search
 against the projected codebook and decoding only looks codes up in that codebook.
+
+Matmuls run at the training precision (TF32 inputs, fp32 sums) except the two heaviest ones, the
+codebook search and the decoder's ConvNeXt pointwise layers: they take fp16 operands, which have
+the same 10-bit mantissa as TF32 and twice its tensor-core rate. Operands are scaled by powers of
+two (exact) so that small values stay out of fp16's subnormal range, and rounded like the GPU's
+TF32 conversion, so the inputs equal the TF32 inputs; sums and outputs stay fp32.
 """
 
 from __future__ import annotations
 
-from typing import Any
+import math
+from typing import Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
+from jax.experimental import pallas as pl
+from jax.experimental.pallas import triton as pl_triton
 
 from ..model_config import NetworkConfig
 
 F32 = jnp.float32
+F16 = jnp.float16
+
+
+def pow2_scale(bound: jnp.ndarray) -> jnp.ndarray:
+    """2^k with bound * 2^k < 2^15: fits fp16 (max 65504) with headroom; applying and undoing it
+    is exact."""
+    _, exp = jnp.frexp(jnp.maximum(jnp.asarray(bound, F32), jnp.finfo(F32).tiny))
+    return jnp.ldexp(F32(1.0), jnp.clip(15 - exp, -100, 100))
+
+
+def to_f16(x: jnp.ndarray) -> jnp.ndarray:
+    """fp32 -> fp16 rounded to nearest with ties away from zero, as Ampere GPUs convert fp32 to
+    TF32 (measured for cuBLAS and cuDNN); exact for fp16's normal range."""
+    bits = jax.lax.bitcast_convert_type(x.astype(F32), jnp.uint32)
+    bits = (bits + jnp.uint32(0x1000)) & jnp.uint32(0xFFFFE000)
+    return jax.lax.bitcast_convert_type(bits, F32).astype(F16)
 
 
 def _resolve_groups(channels: int, max_groups: int) -> int:
@@ -156,28 +181,44 @@ class Encoder(nn.Module):
         return h
 
 
-def _lstm_direction(x: jnp.ndarray, x_kernel, x_bias, h_kernel, hidden: int, forget_bias: float) -> jnp.ndarray:
-    batch = x.shape[0]
-    x_time = jnp.swapaxes(x, 0, 1)
-    h0 = jnp.zeros((batch, hidden), dtype=F32)
-    c0 = jnp.zeros((batch, hidden), dtype=F32)
-    x_gates = jnp.matmul(x_time, x_kernel.astype(F32)) + x_bias.astype(F32)
+LSTM_UNROLL = 8  # time steps per loop iteration of the recurrence
+
+
+def _input_gates(x: jnp.ndarray, x_kernel, x_bias) -> jnp.ndarray:
+    """(B, T, D) -> time-major input contributions to the gates (T, B, 4H)."""
+    return jnp.matmul(jnp.swapaxes(x, 0, 1), x_kernel.astype(F32)) + x_bias.astype(F32)
+
+
+def _lstm_cell(state, gates_x: jnp.ndarray, h_kernel: jnp.ndarray, fb: jnp.ndarray):
+    h_prev, c_prev = state
+    gates = gates_x + jnp.matmul(h_prev, h_kernel)
+    i, f, g, o = jnp.split(gates, 4, axis=-1)
+    i = nn.sigmoid(i)
+    f = nn.sigmoid(f + fb)
+    g = jnp.tanh(g)
+    o = nn.sigmoid(o)
+    c = f * c_prev + i * g
+    h = o * jnp.tanh(c)
+    return h, c
+
+
+def _bilstm(x: jnp.ndarray, p: dict, hidden: int, forget_bias: float) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Both directions of a layer in one scan: step t runs the forward cell on x[:, t] and the
+    backward cell on x[:, T-1-t]. Each cell computes exactly what a scan per direction would;
+    sharing the loop halves the sequential iterations, which bound the time on a GPU."""
+    gates_f = _input_gates(x, p["fwd_x_kernel"], p["fwd_x_bias"])
+    gates_b = _input_gates(jnp.flip(x, axis=1), p["bwd_x_kernel"], p["bwd_x_bias"])
+    h_kernel_f, h_kernel_b = p["fwd_h_kernel"].astype(F32), p["bwd_h_kernel"].astype(F32)
     fb = jnp.asarray(forget_bias, dtype=F32)
+    zeros = jnp.zeros((x.shape[0], hidden), dtype=F32)
 
-    def step(carry, gates_x):
-        h_prev, c_prev = carry
-        gates = gates_x + jnp.matmul(h_prev, h_kernel.astype(F32))
-        i, f, g, o = jnp.split(gates, 4, axis=-1)
-        i = nn.sigmoid(i)
-        f = nn.sigmoid(f + fb)
-        g = jnp.tanh(g)
-        o = nn.sigmoid(o)
-        c = f * c_prev + i * g
-        h = o * jnp.tanh(c)
-        return (h, c), h
+    def step(carry, gates):
+        fwd = _lstm_cell(carry[0], gates[0], h_kernel_f, fb)
+        bwd = _lstm_cell(carry[1], gates[1], h_kernel_b, fb)
+        return (fwd, bwd), (fwd[0], bwd[0])
 
-    _, y_time = jax.lax.scan(step, (h0, c0), x_gates)
-    return jnp.swapaxes(y_time, 0, 1)
+    _, (y_f, y_b) = jax.lax.scan(step, ((zeros, zeros), (zeros, zeros)), (gates_f, gates_b), unroll=LSTM_UNROLL)
+    return jnp.swapaxes(y_f, 0, 1), jnp.flip(jnp.swapaxes(y_b, 0, 1), axis=1)
 
 
 class BiLSTMLayer(nn.Module):
@@ -201,9 +242,7 @@ class BiLSTMLayer(nn.Module):
             )
         }
         h = x.astype(F32)
-        fwd = _lstm_direction(h, p["fwd_x_kernel"], p["fwd_x_bias"], p["fwd_h_kernel"], self.hidden, self.forget_bias)
-        bwd = _lstm_direction(jnp.flip(h, axis=1), p["bwd_x_kernel"], p["bwd_x_bias"], p["bwd_h_kernel"], self.hidden, self.forget_bias)
-        bwd = jnp.flip(bwd, axis=1)
+        fwd, bwd = _bilstm(h, p, self.hidden, self.forget_bias)
         y = nn.Dense(self.dim, use_bias=True, name="out_proj")(jnp.concatenate((fwd, bwd), axis=-1))
         return (h + y).astype(F32)
 
@@ -242,6 +281,21 @@ def _swish(x: jnp.ndarray) -> jnp.ndarray:
     return x * nn.sigmoid(x)
 
 
+class F16Dense(nn.Module):
+    """Dense layer (same parameters as nn.Dense) on fp16 operands with fp32 sums and output.
+    `bound` caps |inputs|; the kernel is scaled by its own largest value."""
+
+    features: int
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray, bound: jnp.ndarray) -> jnp.ndarray:
+        kernel = self.param("kernel", nn.initializers.zeros, (x.shape[-1], self.features), F32)
+        bias = self.param("bias", nn.initializers.zeros, (self.features,), F32)
+        sx, sk = pow2_scale(bound), pow2_scale(jnp.max(jnp.abs(kernel)))
+        y = jnp.dot(to_f16(x * sx), to_f16(kernel * sk), preferred_element_type=F32)
+        return y * (1.0 / (sx * sk)) + bias
+
+
 class ConvNeXtBlock(nn.Module):
     dim: int
     intermediate: int
@@ -249,10 +303,19 @@ class ConvNeXtBlock(nn.Module):
     @nn.compact
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
         h = ReflectConv1d(self.dim, 7, feature_group_count=self.dim, use_bias=True, name="dwconv")(x)
-        h = nn.LayerNorm(dtype=F32, param_dtype=F32, name="norm")(h)
-        h = nn.Dense(self.intermediate, use_bias=True, name="pwconv1")(h)
+        norm = nn.LayerNorm(dtype=F32, param_dtype=F32, name="norm")
+        h = norm(h)
+        # Input bounds from the weights, so the fp16 scales can never overflow: a layer-normalized
+        # value is at most sqrt(C - 1) in magnitude before scale and bias; tanh-GELU of y is at
+        # most max(|y|, 0.17).
+        p = norm.variables["params"]
+        per_input = jnp.abs(p["scale"]) * math.sqrt(self.dim - 1) + jnp.abs(p["bias"])
+        pw1 = F16Dense(self.intermediate, name="pwconv1")
+        h = pw1(h, jnp.max(per_input))
+        q = pw1.variables["params"]
+        bound2 = jnp.max(per_input @ jnp.abs(q["kernel"]) + jnp.abs(q["bias"]))
         h = nn.gelu(h, approximate=True)
-        h = nn.Dense(self.dim, use_bias=True, name="pwconv2")(h)
+        h = F16Dense(self.dim, name="pwconv2")(h, jnp.maximum(bound2, 0.17))
         gamma = self.param("gamma", nn.initializers.zeros, (self.dim,), F32)
         return x + h * gamma.astype(h.dtype)
 
@@ -422,39 +485,75 @@ class NanoReconNet(nn.Module):
         return self.reconstruct(self.latents(x)), self.projected_codebook()
 
 
-def nearest_codeword(z: jnp.ndarray, codebook: jnp.ndarray, block_size: int) -> jnp.ndarray:
-    """Exact nearest neighbour (squared L2) of each row of z (N, D) in codebook (K, D).
+# Codebook search tile: latent rows, codewords, dimensions per step, then Triton warps and
+# pipeline stages. Tuned on an RTX 3080 Ti; changing it never changes the codes.
+SEARCH_TILE = (64, 256, 32, 4, 3)
 
-    Same arithmetic and tie rule as training: distances ||z||^2 + ||e||^2 - 2 z.e per codebook
-    block, first minimum within a block, strictly smaller distance needed to replace a winner
-    from an earlier block (so ties resolve to the lowest index). Peak memory is N x block.
-    """
+
+class SearchCodebook(NamedTuple):
+    """The projected codebook prepared once for the search."""
+
+    codes: jnp.ndarray  # fp16 (K, D): codebook * 2^k, zero-padded to whole search tiles
+    inverse_scale: jnp.ndarray  # 2^-k
+    norms: jnp.ndarray  # fp32 (K,): ||e||^2 of the fp32 codebook, inf for padding rows
+
+
+def search_codebook(codebook: jnp.ndarray) -> SearchCodebook:
+    _, tile_codes, tile_dims, _, _ = SEARCH_TILE
     num_codes, dim = codebook.shape
-    block = max(1, int(block_size))
-    z = z.astype(codebook.dtype)
-    z_norm = jnp.sum(z**2, axis=1, keepdims=True)
-    if block >= num_codes:
-        dists = z_norm + jnp.sum(codebook**2, axis=1)[None, :] - 2.0 * jnp.dot(z, codebook.T)
-        return jnp.argmin(dists, axis=1).astype(jnp.int32)
-    n_blocks = -(-num_codes // block)
-    pad = n_blocks * block - num_codes
-    if pad:
-        codebook = jnp.pad(codebook, ((0, pad), (0, 0)))
-    blocks = codebook.reshape(n_blocks, block, dim)
-    arange_b = jnp.arange(block, dtype=jnp.int32)
-    inf = jnp.asarray(jnp.inf, dtype=z_norm.dtype)
+    scale = pow2_scale(jnp.max(jnp.abs(codebook)))
+    codes = jnp.pad(to_f16(codebook * scale), ((0, -num_codes % tile_codes), (0, -dim % tile_dims)))
+    norms = jnp.pad(jnp.sum(codebook.astype(F32) ** 2, axis=1), (0, -num_codes % tile_codes), constant_values=jnp.inf)
+    return SearchCodebook(codes, 1.0 / scale, norms)
 
-    def step(carry, xs):
-        best_dist, best_idx = carry
-        codes, block_id = xs
-        offset = block_id * block
-        dists = z_norm + jnp.sum(codes**2, axis=1)[None, :] - 2.0 * jnp.dot(z, codes.T)
-        dists = jnp.where(((offset + arange_b) < num_codes)[None, :], dists, inf)
-        arg = jnp.argmin(dists, axis=1).astype(jnp.int32)
-        dist = jnp.take_along_axis(dists, arg[:, None], axis=1)[:, 0]
-        better = dist < best_dist
-        return (jnp.where(better, dist, best_dist), jnp.where(better, offset + arg, best_idx)), None
 
-    init = (jnp.full((z.shape[0],), jnp.inf, dtype=z_norm.dtype), jnp.zeros((z.shape[0],), dtype=jnp.int32))
-    (_, best_idx), _ = jax.lax.scan(step, init, (blocks, jnp.arange(n_blocks, dtype=jnp.int32)))
-    return best_idx
+def nearest_codeword(z: jnp.ndarray, codebook: SearchCodebook) -> jnp.ndarray:
+    """Exact nearest neighbour (squared L2) of each row of z (N, D) in the codebook.
+
+    Distances ||z||^2 + ||e||^2 - 2 z.e as in training, with z.e on fp16 operands (TF32-equal
+    inputs, fp32 sums). One GPU kernel computes the distances tile by tile and keeps only each
+    row's minimum per tile with its first index, so the N x K distances never reach GPU memory;
+    the tile minima are then compared in codebook order, so ties resolve to the lowest index.
+    """
+    rows, codes, dims, warps, stages = SEARCH_TILE
+    num_rows = z.shape[0]
+    num_codes, dim = codebook.codes.shape
+    z = z.astype(F32)
+    z_scale = pow2_scale(jnp.max(jnp.abs(z), axis=1))  # per row: rows never affect each other
+    pad = (0, -num_rows % rows)
+    z16 = jnp.pad(to_f16(z * z_scale[:, None]), (pad, (0, dim - z.shape[1])))
+    unscale = jnp.pad(codebook.inverse_scale / z_scale, pad)
+    z_norm = jnp.pad(jnp.sum(z**2, axis=1), pad)
+
+    def kernel(z_ref, codes_ref, unscale_ref, z_norm_ref, norms_ref, low_ref, first_ref):
+        def step(k, acc):
+            cols = pl.ds(k * dims, dims)
+            return acc + pl.dot(z_ref[:, cols], codes_ref[:, cols], trans_b=True)
+
+        dots = jax.lax.fori_loop(0, dim // dims, step, jnp.zeros((rows, codes), F32))
+        dists = z_norm_ref[...][:, None] + norms_ref[...][None, :] - 2.0 * (dots * unscale_ref[...][:, None])
+        low = jnp.min(dists, axis=1)
+        first = jnp.min(jnp.where(dists == low[:, None], jnp.arange(codes, dtype=jnp.int32)[None, :], codes), axis=1)
+        low_ref[0, :] = low
+        first_ref[0, :] = first + pl.program_id(1) * codes
+
+    tiles = (z16.shape[0] // rows, num_codes // codes)
+    out = jax.ShapeDtypeStruct((tiles[1], z16.shape[0]), F32)
+    lows, firsts = pl.pallas_call(
+        kernel,
+        out_shape=(out, out.update(dtype=jnp.int32)),
+        grid=tiles,
+        in_specs=(
+            pl.BlockSpec((rows, dim), lambda i, j: (i, 0)),
+            pl.BlockSpec((codes, dim), lambda i, j: (j, 0)),
+            pl.BlockSpec((rows,), lambda i, j: (i,)),
+            pl.BlockSpec((rows,), lambda i, j: (i,)),
+            pl.BlockSpec((codes,), lambda i, j: (j,)),
+        ),
+        out_specs=(pl.BlockSpec((1, rows), lambda i, j: (j, i)),) * 2,
+        compiler_params=pl_triton.CompilerParams(num_warps=warps, num_stages=stages),
+        interpret=jax.default_backend() == "cpu",  # unit tests on a machine without a GPU
+        name="nearest_codeword",
+    )(z16, codebook.codes, unscale, z_norm, codebook.norms)
+    best_tile = jnp.argmin(lows, axis=0)  # the first tile holding the minimum
+    return jnp.take_along_axis(firsts, best_tile[None, :], axis=0)[0, :num_rows]

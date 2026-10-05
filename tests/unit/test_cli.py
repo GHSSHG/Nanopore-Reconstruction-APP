@@ -53,10 +53,7 @@ def test_version_and_help(capsys):
     [
         ("compress", "x.pod5"),  # missing -o
         ("compress", "x.pod5", "-o", "y", "--batch-size", "0"),
-        ("compress", "x.pod5", "-o", "y", "--workers", "4"),  # removed options
-        ("compress", "x.pod5", "-o", "y", "--device", "cpu"),
-        ("compress", "x.pod5", "-o", "y", "--memory-budget-mib", "512"),
-        ("ls", "--json"),
+        ("compress", "x.pod5", "-o", "y", "--no-such-option"),
         ("frobnicate",),
     ],
 )

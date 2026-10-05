@@ -1,8 +1,10 @@
 """Batch inference engine: encode(float32[B, L]) -> uint16[B, T], decode(uint16[B, T]) -> float32[B, L].
 
 One fixed batch shape is compiled per direction; the caller pads the last batch and only the
-first `valid_rows` rows are returned. Every call waits for the device result before returning,
-so the caller may reuse its host buffers immediately and at most one call is in flight.
+first `valid_rows` rows are returned. encode/decode wait for the result. encode_async and
+decode_async return as soon as the batch is on its way to the GPU, with a function that waits for
+the result, so the host can prepare the next batch meanwhile; the input array must stay unchanged
+until that function has returned.
 """
 
 from __future__ import annotations
@@ -11,6 +13,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 
@@ -25,7 +28,7 @@ log = logging.getLogger("nanorecon")
 class EngineTimings:
     load_s: float = 0.0
     compile_s: dict[str, float] = field(default_factory=dict)
-    compute_s: dict[str, float] = field(default_factory=dict)
+    compute_s: dict[str, float] = field(default_factory=dict)  # host time spent dispatching and waiting
     calls: dict[str, int] = field(default_factory=dict)
 
     def summary(self) -> str:
@@ -54,7 +57,7 @@ class JaxCodecEngine:
             import jax.numpy as jnp
         except Exception as exc:  # broken CUDA plugin installs fail at import time
             raise NanoReconError(f"cannot initialize JAX: {exc}") from exc
-        from .network import NanoReconNet, nearest_codeword
+        from .network import NanoReconNet, nearest_codeword, search_codebook
         from .weights import check_structure, load_variables
 
         configure_jax(compilation_cache)
@@ -75,18 +78,18 @@ class JaxCodecEngine:
         check_structure(host_vars, dict(expected))
         self._variables = jax.device_put(host_vars, self.device)
         del host_vars
-        self._codebook = jax.jit(lambda v: net.apply(v, method=NanoReconNet.projected_codebook))(self._variables)
-        self._codebook.block_until_ready()
+        codebook = jax.jit(lambda v: net.apply(v, method=NanoReconNet.projected_codebook))(self._variables)
+        self._operands = {"encode": jax.jit(search_codebook)(codebook), "decode": codebook}
+        jax.block_until_ready(self._operands)
         self.timings.load_s = time.perf_counter() - t0
 
-        block = network.search_chunk_size
         tokens, dim = self.tokens_per_chunk, network.quantizer_dim
 
-        def encode_fn(variables, codebook, x):
+        def encode_fn(variables, search, x):
             z = net.apply(variables, x, method=NanoReconNet.latents)
             if z.shape[1] != tokens:
                 raise ValueError(f"encoder produced {z.shape[1]} tokens, profile says {tokens}")
-            idx = nearest_codeword(z.reshape(-1, dim), codebook, block)
+            idx = nearest_codeword(z.reshape(-1, dim), search)
             return idx.reshape(x.shape[0], tokens)
 
         def decode_fn(variables, codebook, idx):
@@ -106,7 +109,7 @@ class JaxCodecEngine:
             log.info("compiling %s for batch %d (first use)", direction, self.batch_size)
             t0 = time.perf_counter()
             try:
-                compiled = self._fns[direction].lower(self._variables, self._codebook, self._input_specs[direction]).compile()
+                compiled = self._fns[direction].lower(self._variables, self._operands[direction], self._input_specs[direction]).compile()
             except Exception as exc:
                 hint = "this GPU/cuDNN may not support cuDNN attention" if direction == "decode" and self.attention == "cudnn" else None
                 raise NanoReconError(f"cannot compile {direction}: {exc}", hint=hint) from exc
@@ -114,25 +117,45 @@ class JaxCodecEngine:
             self._compiled[direction] = compiled
         return compiled
 
-    def _run(self, direction: str, host_input: np.ndarray) -> np.ndarray:
+    def _submit(self, direction: str, host_input: np.ndarray) -> Callable[[], np.ndarray]:
         executable = self._executable(direction)
         t0 = time.perf_counter()
-        device_input = self._jax.device_put(host_input, self.device)
-        result = np.asarray(executable(self._variables, self._codebook, device_input))
-        self.timings.compute_s[direction] = self.timings.compute_s.get(direction, 0.0) + time.perf_counter() - t0
+        device_result = executable(self._variables, self._operands[direction], self._jax.device_put(host_input, self.device))
+        self._account(direction, time.perf_counter() - t0)
         self.timings.calls[direction] = self.timings.calls.get(direction, 0) + 1
+
+        def wait() -> np.ndarray:
+            t1 = time.perf_counter()
+            result = np.asarray(device_result)
+            self._account(direction, time.perf_counter() - t1)
+            return result
+
+        return wait
+
+    def _account(self, direction: str, seconds: float) -> None:
+        self.timings.compute_s[direction] = self.timings.compute_s.get(direction, 0.0) + seconds
+
+    def encode_async(self, batch: np.ndarray, valid_rows: int) -> Callable[[], np.ndarray]:
+        if batch.shape != (self.batch_size, self.chunk_samples) or batch.dtype != np.float32:
+            raise ValueError(f"encode expects float32{[self.batch_size, self.chunk_samples]}, got {batch.dtype}{list(batch.shape)}")
+        wait = self._submit("encode", batch)
+        return lambda: wait()[:valid_rows].astype(np.uint16)
+
+    def decode_async(self, codes: np.ndarray, valid_rows: int) -> Callable[[], np.ndarray]:
+        if codes.shape != (self.batch_size, self.tokens_per_chunk):
+            raise ValueError(f"decode expects {[self.batch_size, self.tokens_per_chunk]} codes, got {list(codes.shape)}")
+        wait = self._submit("decode", codes.astype(np.int32))
+
+        def result() -> np.ndarray:
+            out = np.array(wait()[:valid_rows], dtype=np.float32, copy=True)
+            if not np.isfinite(out).all():
+                raise NanoReconError("decoder produced non-finite samples")
+            return out
+
         return result
 
     def encode(self, batch: np.ndarray, valid_rows: int) -> np.ndarray:
-        if batch.shape != (self.batch_size, self.chunk_samples) or batch.dtype != np.float32:
-            raise ValueError(f"encode expects float32{[self.batch_size, self.chunk_samples]}, got {batch.dtype}{list(batch.shape)}")
-        return self._run("encode", batch)[:valid_rows].astype(np.uint16)
+        return self.encode_async(batch, valid_rows)()
 
     def decode(self, codes: np.ndarray, valid_rows: int) -> np.ndarray:
-        if codes.shape != (self.batch_size, self.tokens_per_chunk):
-            raise ValueError(f"decode expects {[self.batch_size, self.tokens_per_chunk]} codes, got {list(codes.shape)}")
-        wave = self._run("decode", codes.astype(np.int32))
-        out = np.array(wave[:valid_rows], dtype=np.float32, copy=True)
-        if not np.isfinite(out).all():
-            raise NanoReconError("decoder produced non-finite samples")
-        return out
+        return self.decode_async(codes, valid_rows)()

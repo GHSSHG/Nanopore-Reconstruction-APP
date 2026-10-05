@@ -53,7 +53,6 @@ _FOUNDATION_DEFAULTS: dict[str, Any] = {
     "latent_bilstm_layers": 2,
     "latent_bilstm_hidden_dim": 256,
     "diveq_sigma2": 1e-3,
-    "search_chunk_size": 2048,
     "quant_conv_kernel_size": 7,
     "post_quant_conv_kernel_size": 7,
     "encoder_use_block_norm": True,
@@ -79,7 +78,6 @@ class NetworkConfig:
     codebook_size: int
     quant_conv_kernel_size: int
     post_quant_conv_kernel_size: int
-    search_chunk_size: int
     dec_channels: tuple[int, ...]
     decoder_dim: int
     decoder_intermediate_dim: int
@@ -152,7 +150,6 @@ def parse_network_config(model_cfg: Mapping[str, Any]) -> NetworkConfig:
         codebook_size=int(cfg["codebook_size"]),
         quant_conv_kernel_size=int(cfg["quant_conv_kernel_size"]),
         post_quant_conv_kernel_size=int(cfg["post_quant_conv_kernel_size"]),
-        search_chunk_size=int(cfg["search_chunk_size"]),
         dec_channels=ints("dec_channels"),
         decoder_dim=int(cfg["decoder_dim"]),
         decoder_intermediate_dim=int(cfg["decoder_intermediate_dim"]),
