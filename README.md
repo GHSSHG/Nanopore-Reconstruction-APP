@@ -73,21 +73,24 @@ Results go to stdout as one line; logs, progress and errors go to stderr. Exit c
 
 ## Recommended settings
 
-Measured with 1.0.0 on an RTX 3080 Ti (12 GB), with simulated files of about 3 000 chunks
-(one chunk is 8 192 samples; model loading and compilation not included):
+Measured with 1.0.0 on the lab's A100-class GPU (32 GB) with real data, about 10 000 chunks
+per file (one chunk is 8 192 samples; model loading and compilation not included):
 
 | `--batch-size` | Compression | Decompression | GPU memory |
 |---|---|---|---|
-| 16 | 440-460 chunks/s | 380 chunks/s | 1.0 GiB |
-| 64 (default) | 670-700 chunks/s | 390-400 chunks/s | 1.4 GiB |
-| 256 | 750-820 chunks/s | 380 chunks/s | 3.4 GiB |
+| 16 | 490-510 chunks/s | 870-880 chunks/s | 1.2 GiB |
+| 64 (default) | 1 010-1 080 chunks/s | 1 030 chunks/s | 1.7 GiB |
+| 256 | 1 440-1 560 chunks/s | 1 070 chunks/s | 4.1 GiB |
+| 512 | 1 550-1 640 chunks/s | 1 060-1 080 chunks/s | 6.6 GiB |
 
-The lab's A100-class GPUs are faster: there, 0.3.0 compressed 1.7-2.2 times faster than on
-this card. 1.0.0 has not been measured on them yet. Details: [docs/validation.md](docs/validation.md).
+A 2 GB long-read POD5 (about 290 000 chunks) thus compresses in about 3 minutes at batch 512 and
+decompresses in about 5 minutes. On an RTX 3080 Ti (12 GB) compression is about half as fast
+and decompression about 2.6 times slower; batch 512 does not fit there. Details:
+[docs/validation.md](docs/validation.md).
 
-* **Lab server (32 GB GPUs, 512 GB RAM):** compress with `--batch-size 256`. Decompress with the
-  default 64, because larger batches do not make decompression faster. Host memory is no
-  concern: a run needs about 2 GB of RAM.
+* **Lab server (32 GB GPUs, 512 GB RAM):** compress with `--batch-size 512`. Decompress with the
+  default 64: larger batches make decompression only about 4% faster. Host memory is no
+  concern: a run needs about 2.5 GB of RAM.
 * **Many files:** the GPU is the bottleneck, so run one process per GPU, each on its own share of
   the files:
 
@@ -96,15 +99,17 @@ this card. 1.0.0 has not been measured on them yet. Details: [docs/validation.md
   for gpu in 0 1 2 3; do
     (
       for f in $(ls pod5/*.pod5 | awk -v g=$gpu 'NR % 4 == g'); do
-        CUDA_VISIBLE_DEVICES=$gpu nanorecon compress "$f" -o "out/$(basename "$f" .pod5).nrpod" --batch-size 256
+        CUDA_VISIBLE_DEVICES=$gpu nanorecon compress "$f" -o "out/$(basename "$f" .pod5).nrpod" --batch-size 512
       done
     ) &
   done
   wait
   ```
 
-* **Smaller or shared GPUs (other jobs on the same card):** batch 256 needs about 3.5 GiB of GPU
-  memory; use the default 64 when less is free. Batch 512 did not fit on a 12 GB card.
+* **Smaller or shared GPUs (other jobs on the same card):** batch 512 needs about 7 GiB of GPU
+  memory. Batch 256 needs about 4 GiB and compresses 5-8% slower; use the default 64 when less
+  is free.
+  Batch 512 did not fit on a 12 GB card.
 * Long runs keep the GPUs at full load; keep an eye on their temperature (`nvidia-smi`).
 
 ## Files and caches

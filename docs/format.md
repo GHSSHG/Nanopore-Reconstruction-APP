@@ -302,7 +302,7 @@ to integers before merging. A future change of the weighting gets a new stitch n
   compilation cache in `~/.cache/nanorecon/jax`). A new compilation lets XLA's autotuner choose the
   fastest GPU kernels again; kernels that sum in a different order can flip near-tie codewords.
   Between separate compilations for the same batch size up to about 0.5% of codes differed (RTX
-  3080 Ti), between batch 16, 64 and 256 0.6-0.8% (A100-class GPU), with unchanged reconstruction
-  error. Batch size, GPU model and library versions act the same way. The decoder is affected
+  3080 Ti), between batch 16 and larger batches 0.7-0.9% (A100-class GPU), with unchanged
+  reconstruction error. Batch size, GPU model and library versions act the same way. The decoder is affected
   alike: the same codes decoded with batch 64 and with batch 256 differed in about 1% of the output
   samples by one ADC unit.
